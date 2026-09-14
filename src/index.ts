@@ -316,8 +316,7 @@ export function apply(ctx: Context, config: Config): void {
   })
   ctx.on('dispose', () => monitor.dispose())
 
-  ctx.command('codex probability', '分析 Codex 重置事件的历史概率')
-    .alias('codex-reset.probability')
+  ctx.command('codex.probability', '分析 Codex 重置事件的历史概率')
     .alias('重置概率')
     .action(async () => {
       if (!config.enableProbabilityCommand) return '重置概率命令已关闭。'
@@ -326,8 +325,7 @@ export function apply(ctx: Context, config: Config): void {
       return formatProbability(analyzeProbability(snapshot))
     })
 
-  ctx.command('codex event', '查看上一次 Codex 重置距今多久')
-    .alias('codex-reset.event')
+  ctx.command('codex.event', '查看上一次 Codex 重置距今多久')
     .alias('最近重置')
     .action(async () => {
       const snapshot = await monitor.ensureSnapshot()
@@ -335,8 +333,7 @@ export function apply(ctx: Context, config: Config): void {
       return formatLatestReset(snapshot)
     })
 
-  ctx.command('codex calendar', '发送本月的 Codex 重置日历图片')
-    .alias('codex-reset.calendar')
+  ctx.command('codex.calendar', '发送本月的 Codex 重置日历图片')
     .alias('重置日历')
     .action(async () => {
       if (!config.enableCalendarCommand) return '重置日历命令已关闭。'
@@ -351,8 +348,7 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
 
-  ctx.command('codex history', '发送 Codex 重置历史时间线图片')
-    .alias('codex-reset.history')
+  ctx.command('codex.history', '发送 Codex 重置历史时间线图片')
     .alias('重置历史')
     .action(async () => {
       if (!config.enableHistoryCommand) return '重置历史命令已关闭。'

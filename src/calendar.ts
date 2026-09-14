@@ -210,7 +210,7 @@ function renderDetails(selectedDate: string, marks: Map<string, CalendarMark[]>)
   const header = formatDateHeader(selectedDate)
   const selectedEvents = [...new Map((marks.get(selectedDate) ?? []).map((mark) => [mark.event.id, mark.event])).values()]
   const groups = selectedEvents.map((event) => {
-    const status = event.status === 'confirmed' ? '已重置' : '待确认'
+    const status = event.status === 'confirmed' ? '已重置' : '未重置预告'
     const statusClass = event.status === 'confirmed' ? 'confirmed-state' : 'announced-state'
     const posts = event.posts.slice(0, 3).map((post) => renderPostCard(event, post)).join('')
     return `<section class="event-group">

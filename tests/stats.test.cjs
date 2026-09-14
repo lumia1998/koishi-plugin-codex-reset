@@ -39,6 +39,7 @@ test('analyzes confirmed event days and pending announcements', () => {
   assert.equal(result.activeDays, 2)
   assert.ok(result.next7dProbability > result.next24hProbability)
   assert.match(formatProbability(result), /不是官方预测/)
+  assert.match(formatProbability(result), /未重置预告 1 条/)
 })
 
 test('formats the latest confirmed reset as elapsed hours', () => {

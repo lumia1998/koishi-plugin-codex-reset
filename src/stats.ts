@@ -178,7 +178,7 @@ export function formatProbability(summary: ProbabilitySummary): string {
   const lines = [
     'Codex 重置事件概率分析（历史统计）',
     `样本：${summary.observedDays} 天，已确认事件 ${summary.confirmedCount} 条，发生过事件的日期 ${summary.activeDays} 天。`,
-    `其中：全员重置 ${summary.directResetCount} 条，重置卡 ${summary.resetCreditCount} 条，待确认预告 ${summary.announcedCount} 条。`,
+    `其中：全员重置 ${summary.directResetCount} 条，重置卡 ${summary.resetCreditCount} 条，未重置预告 ${summary.announcedCount} 条。`,
   ]
 
   if (summary.confirmedCount === 0 || summary.activeDays === 0) {

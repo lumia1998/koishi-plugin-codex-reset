@@ -181,7 +181,7 @@ export function renderHistoryHtml(events: CodexResetEvent[], now = new Date()): 
         <div class="stat"><span>已确认</span><strong>${confirmed.length}</strong></div>
         <div class="stat"><span>全员重置</span><strong>${directResetCount}</strong></div>
         <div class="stat"><span>重置卡</span><strong>${resetCreditCount}</strong></div>
-        <div class="stat"><span>待确认预告</span><strong>${announcedCount}</strong></div>
+        <div class="stat"><span>未重置预告</span><strong>${announcedCount}</strong></div>
         <p class="summary-note">数据来自 AIHOT 公开快照。时间线仅展示公开事件，不代表账户一定获得重置。</p>
       </aside>
     </div>

@@ -2,7 +2,9 @@ import { Context, h, Schema } from 'koishi'
 import type { CalendarBrowser } from './calendar'
 import { renderCalendarImage } from './calendar'
 import { renderHistoryImage } from './history'
+import { renderProbabilityImage } from './probability'
 import { analyzeProbability, formatLatestReset, formatProbability } from './stats'
+import type { ProbabilitySummary } from './stats'
 import type {
   CodexResetEvent,
   CodexResetsResponse,
@@ -246,6 +248,12 @@ class CodexResetMonitor {
     return renderHistoryImage(browser, snapshot.events)
   }
 
+  async createProbabilityImage(summary: ProbabilitySummary): Promise<Buffer | null> {
+    const browser = this.ctx.puppeteer
+    if (!browser) return null
+    return renderProbabilityImage(browser, summary)
+  }
+
   private async fetchSnapshot(ignoreEtag = false): Promise<FetchResult> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeout)
@@ -322,7 +330,16 @@ export function apply(ctx: Context, config: Config): void {
       if (!config.enableProbabilityCommand) return '重置概率命令已关闭。'
       const snapshot = await monitor.ensureSnapshot()
       if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
-      return formatProbability(analyzeProbability(snapshot))
+      const summary = analyzeProbability(snapshot)
+      if (!monitor.hasPuppeteer) return formatProbability(summary)
+      try {
+        const image = await monitor.createProbabilityImage(summary)
+        if (!image) return formatProbability(summary)
+        return h.image(image, 'image/png')
+      } catch (error) {
+        ctx.logger('codex-reset').warn(`生成概率卡片失败：${error instanceof Error ? error.message : String(error)}`)
+        return formatProbability(summary)
+      }
     })
 
   ctx.command('codex.event', '查看上一次 Codex 重置距今多久')

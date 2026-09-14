@@ -57,7 +57,4 @@ export interface Config {
   pushAnnouncements: boolean
   pushConfirmedResets: boolean
   mentionAll: boolean
-  enableProbabilityCommand: boolean
-  enableCalendarCommand: boolean
-  enableHistoryCommand: boolean
 }

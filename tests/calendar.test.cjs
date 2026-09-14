@@ -18,7 +18,7 @@ test('renders a monthly calendar with fixed command date and escapes source text
   ], new Date('2026-09-10T00:00:00+08:00'))
   assert.match(html, /calendar-card/)
   assert.match(html, /2026 年 九月/)
-  assert.match(html, /9 月 10 日/)
+  assert.match(html, /最近 2 条动态/)
   assert.match(html, /12/)
   assert.match(html, /&lt;script&gt;/)
   assert.match(html, /avatar-(image|fallback)/)

@@ -30,6 +30,35 @@ function eventTimestamp(event: CodexResetEvent): number {
   return 0
 }
 
+export type HistoryRange = number | 'all'
+
+export function filterHistoryEvents(
+  events: CodexResetEvent[],
+  now = new Date(),
+  range: HistoryRange = 1,
+): CodexResetEvent[] {
+  if (range === 'all') return [...events]
+  const months = Math.max(1, Math.floor(Math.abs(range)))
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+  }).formatToParts(now)
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  const cutoff = Date.UTC(
+    Number(values.year),
+    Number(values.month) - 1 - months,
+    Number(values.day),
+    -8,
+  )
+  const current = now.getTime()
+  return events.filter((event) => {
+    const timestamp = eventTimestamp(event)
+    return timestamp >= cutoff && timestamp <= current
+  })
+}
+
 function dateLabel(timestamp: number): string {
   const parts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',

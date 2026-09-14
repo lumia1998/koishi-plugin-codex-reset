@@ -1,10 +1,11 @@
 import { Context, h, Schema } from 'koishi'
 import type { CalendarBrowser } from './calendar'
 import { renderCalendarImage } from './calendar'
-import { renderHistoryImage } from './history'
+import { filterHistoryEvents, renderHistoryImage } from './history'
+import { renderLatestResetImage } from './event'
 import { renderProbabilityImage } from './probability'
-import { analyzeProbability, formatLatestReset, formatProbability } from './stats'
-import type { ProbabilitySummary } from './stats'
+import { analyzeProbability, findLatestConfirmedReset, formatLatestReset, formatProbability } from './stats'
+import type { LatestResetSummary, ProbabilitySummary } from './stats'
 import type {
   CodexResetEvent,
   CodexResetsResponse,
@@ -48,15 +49,6 @@ export const Config: Schema<Config> = Schema.object({
   mentionAll: Schema.boolean()
     .default(false)
     .description('推送通知时是否艾特全体。需要平台和频道支持全体艾特。'),
-  enableProbabilityCommand: Schema.boolean()
-    .default(true)
-    .description('启用 codex-reset.probability（别名：重置概率）。'),
-  enableCalendarCommand: Schema.boolean()
-    .default(true)
-    .description('启用日历图片命令，需要 Puppeteer 服务生成 PNG。'),
-  enableHistoryCommand: Schema.boolean()
-    .default(true)
-    .description('启用历史时间线图片命令，需要 Puppeteer 服务生成 PNG。'),
 }).i18n({
   'zh-CN': {
     apiUrl: '监控接口地址',
@@ -70,9 +62,6 @@ export const Config: Schema<Config> = Schema.object({
     pushAnnouncements: '推送重置预告',
     pushConfirmedResets: '推送已确认重置',
     mentionAll: '艾特全体',
-    enableProbabilityCommand: '启用重置概率命令',
-    enableCalendarCommand: '启用重置日历命令',
-    enableHistoryCommand: '启用重置历史命令',
   },
 })
 
@@ -241,11 +230,11 @@ class CodexResetMonitor {
     return renderCalendarImage(browser, snapshot.events)
   }
 
-  async createHistoryImage(): Promise<Buffer | null> {
+  async createHistoryImage(events?: CodexResetEvent[], now = new Date()): Promise<Buffer | null> {
     const snapshot = await this.ensureSnapshot()
     const browser = this.ctx.puppeteer
     if (!snapshot || !browser) return null
-    return renderHistoryImage(browser, snapshot.events)
+    return renderHistoryImage(browser, events ?? snapshot.events, now)
   }
 
   async createProbabilityImage(summary: ProbabilitySummary): Promise<Buffer | null> {
@@ -254,13 +243,19 @@ class CodexResetMonitor {
     return renderProbabilityImage(browser, summary)
   }
 
+  async createLatestResetImage(summary: LatestResetSummary, now = new Date()): Promise<Buffer | null> {
+    const browser = this.ctx.puppeteer
+    if (!browser) return null
+    return renderLatestResetImage(browser, summary, now)
+  }
+
   private async fetchSnapshot(ignoreEtag = false): Promise<FetchResult> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeout)
     try {
       const headers: Record<string, string> = {
         Accept: 'application/json',
-        'User-Agent': 'koishi-plugin-codex-reset/0.1.0',
+        'User-Agent': 'koishi-plugin-codex-reset/0.1.3',
       }
       if (!ignoreEtag && this.etag && this.snapshot) headers['If-None-Match'] = this.etag
       const response = await fetch(this.config.apiUrl, {
@@ -327,7 +322,6 @@ export function apply(ctx: Context, config: Config): void {
   ctx.command('codex.probability', '分析 Codex 重置事件的历史概率')
     .alias('重置概率')
     .action(async () => {
-      if (!config.enableProbabilityCommand) return '重置概率命令已关闭。'
       const snapshot = await monitor.ensureSnapshot()
       if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
       const summary = analyzeProbability(snapshot)
@@ -347,13 +341,23 @@ export function apply(ctx: Context, config: Config): void {
     .action(async () => {
       const snapshot = await monitor.ensureSnapshot()
       if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
-      return formatLatestReset(snapshot)
+      const now = new Date()
+      const latest = findLatestConfirmedReset(snapshot, now)
+      if (!latest) return formatLatestReset(snapshot, now)
+      if (!monitor.hasPuppeteer) return formatLatestReset(snapshot, now)
+      try {
+        const image = await monitor.createLatestResetImage(latest, now)
+        if (!image) return formatLatestReset(snapshot, now)
+        return h.image(image, 'image/png')
+      } catch (error) {
+        ctx.logger('codex-reset').warn(`生成最近重置卡片失败：${error instanceof Error ? error.message : String(error)}`)
+        return formatLatestReset(snapshot, now)
+      }
     })
 
   ctx.command('codex.calendar', '发送本月的 Codex 重置日历图片')
     .alias('重置日历')
     .action(async () => {
-      if (!config.enableCalendarCommand) return '重置日历命令已关闭。'
       if (!monitor.hasPuppeteer) return '发送日历图片需要先安装并启用 koishi-plugin-puppeteer。'
       try {
         const image = await monitor.createCalendarImage()
@@ -365,13 +369,20 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
 
-  ctx.command('codex.history', '发送 Codex 重置历史时间线图片')
+  ctx.command('codex.history [range:number]', '发送 Codex 重置历史时间线图片')
     .alias('重置历史')
-    .action(async () => {
-      if (!config.enableHistoryCommand) return '重置历史命令已关闭。'
+    .option('all', '-a 查看全部历史')
+    .action(async (argv, range?: number) => {
       if (!monitor.hasPuppeteer) return '发送历史时间线图片需要先安装并启用 koishi-plugin-puppeteer。'
       try {
-        const image = await monitor.createHistoryImage()
+        const snapshot = await monitor.ensureSnapshot()
+        if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
+        const now = new Date()
+        const historyRange = argv.options?.all
+          ? 'all' as const
+          : Math.max(1, Math.min(120, Math.floor(Math.abs(range ?? 1))))
+        const events = filterHistoryEvents(snapshot.events, now, historyRange)
+        const image = await monitor.createHistoryImage(events, now)
         if (!image) return '暂时无法生成历史时间线图片，请稍后再试。'
         return h.image(image, 'image/png')
       } catch (error) {

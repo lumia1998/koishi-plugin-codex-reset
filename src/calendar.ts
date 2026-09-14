@@ -121,15 +121,6 @@ function buildMonthMarks(events: CodexResetEvent[], start: Date): Map<string, Ca
   return marks
 }
 
-function formatDateHeader(value: string): { day: string; year: string } {
-  const date = parseDateKey(value)
-  if (!date) return { day: value, year: '' }
-  return {
-    day: `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`,
-    year: String(date.getUTCFullYear()),
-  }
-}
-
 function formatPublishedAt(value: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
@@ -206,23 +197,24 @@ function renderPostCard(event: CodexResetEvent, post: CodexResetEvent['posts'][n
   </article>`
 }
 
-function renderDetails(selectedDate: string, marks: Map<string, CalendarMark[]>): string {
-  const header = formatDateHeader(selectedDate)
-  const selectedEvents = [...new Map((marks.get(selectedDate) ?? []).map((mark) => [mark.event.id, mark.event])).values()]
-  const groups = selectedEvents.map((event) => {
+function renderDetails(events: CodexResetEvent[]): string {
+  const latestPosts = events
+    .flatMap((event) => event.posts.map((post) => ({ event, post })))
+    .sort((a, b) => Date.parse(b.post.publishedAt) - Date.parse(a.post.publishedAt))
+    .slice(0, 2)
+  const groups = latestPosts.map(({ event, post }) => {
     const status = event.status === 'confirmed' ? '已重置' : '未重置预告'
     const statusClass = event.status === 'confirmed' ? 'confirmed-state' : 'announced-state'
-    const posts = event.posts.slice(0, 3).map((post) => renderPostCard(event, post)).join('')
     return `<section class="event-group">
       <div class="event-state ${statusClass}"><span class="state-icon">${event.status === 'confirmed' ? '✓' : '◷'}</span>${status}</div>
       <h2>${escapeHtml(event.title)}</h2>
-      ${posts || '<div class="post-card empty-post">暂无来源帖子内容</div>'}
+      ${renderPostCard(event, post)}
     </section>`
   }).join('')
 
   return `<aside class="details-pane">
-    <div class="details-header"><h2>${header.day}</h2><span>${header.year}</span></div>
-    <div class="details-body">${groups || '<div class="empty-state">这一天没有记录</div>'}</div>
+    <div class="details-header"><h2>最近 2 条动态</h2><span>北京时间</span></div>
+    <div class="details-body">${groups || '<div class="empty-state">暂无来源帖子内容</div>'}</div>
   </aside>`
 }
 
@@ -231,8 +223,8 @@ export function renderCalendarHtml(events: CodexResetEvent[], now = new Date()):
   const todayDate = parseDateKey(today) ?? new Date()
   const month = monthStart(todayDate)
   const marks = buildMonthMarks(events, month)
-  // A static image has no interactive selection. The detail pane always represents
-  // the Beijing calendar date on which the command was invoked.
+  // The selected day remains the command date on the calendar grid, while the
+  // detail pane shows the two most recently published source posts.
   const selectedDate = today
   const monthEvents = [...new Map([...marks.values()].flat().map((mark) => [mark.event.id, mark.event])).values()]
   const resetCount = monthEvents.filter((event) => event.type === 'direct_reset').length
@@ -311,7 +303,7 @@ export function renderCalendarHtml(events: CodexResetEvent[], now = new Date()):
       <div class="calendar-grid">${renderCalendarGrid(month, marks, selectedDate, today)}</div>
       <div class="calendar-note">按北京时间记录；发放日期不明确的事件，按来源帖子日期展示。</div>
     </section>
-    ${renderDetails(selectedDate, marks)}
+    ${renderDetails(events)}
   </main>
 </body>
 </html>`

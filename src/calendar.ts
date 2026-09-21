@@ -62,7 +62,8 @@ function parseDateKey(value: string): Date | null {
 
 function timestampDateKey(value: string | null | undefined): string | null {
   if (!value) return null
-  return value.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] ?? null
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? beijingDateKey(date) : null
 }
 
 function beijingDateKey(now: Date): string {
@@ -90,11 +91,9 @@ function escapeHtml(value: string): string {
 }
 
 function getEventDateRange(event: CodexResetEvent): [string, string] | null {
-  if (event.status === 'confirmed' && event.occurredOn) return [event.occurredOn, event.occurredOn]
-  const from = timestampDateKey(event.schedule?.from) ?? timestampDateKey(event.confirmedAt) ?? timestampDateKey(event.createdAt)
-  if (!from) return null
-  const through = timestampDateKey(event.schedule?.through) ?? from
-  return [from, through]
+  if (event.status !== 'confirmed') return null
+  const date = event.occurredOn ?? timestampDateKey(event.confirmedAt)
+  return date ? [date, date] : null
 }
 
 function buildMonthMarks(events: CodexResetEvent[], start: Date): Map<string, CalendarMark[]> {
@@ -181,7 +180,6 @@ function renderCalendarGrid(month: Date, marks: Map<string, CalendarMark[]>, sel
 
 function renderPostCard(event: CodexResetEvent, post: CodexResetEvent['posts'][number]): string {
   const text = post.text || post.originalText
-  const schedule = event.schedule?.label ? `<div class="schedule">原预告：${escapeHtml(event.schedule.label)}</div>` : ''
   const avatar = TIBO_AVATAR
     ? `<img class="avatar-image" src="${TIBO_AVATAR}" alt="">`
     : '<span class="avatar-fallback">T</span>'
@@ -192,7 +190,6 @@ function renderPostCard(event: CodexResetEvent, post: CodexResetEvent['posts'][n
       <time>${escapeHtml(formatPublishedAt(post.publishedAt))}</time>
     </div>
     <p class="post-text">${escapeHtml(text)}</p>
-    ${schedule}
     <div class="post-foot">${escapeHtml(post.stage)}</div>
   </article>`
 }
@@ -220,6 +217,10 @@ function renderDetails(events: CodexResetEvent[]): string {
 
 export function renderCalendarHtml(events: CodexResetEvent[], now = new Date()): string {
   const today = beijingDateKey(now)
+  events = events.filter((event) => {
+    const range = getEventDateRange(event)
+    return range !== null && parseDateKey(range[0]) !== null && range[0] <= today
+  })
   const todayDate = parseDateKey(today) ?? new Date()
   const month = monthStart(todayDate)
   const marks = buildMonthMarks(events, month)
@@ -301,7 +302,7 @@ export function renderCalendarHtml(events: CodexResetEvent[], now = new Date()):
       </header>
       <div class="weekday-row">${WEEK_NAMES.map((name) => `<span>${name}</span>`).join('')}</div>
       <div class="calendar-grid">${renderCalendarGrid(month, marks, selectedDate, today)}</div>
-      <div class="calendar-note">按北京时间记录；发放日期不明确的事件，按来源帖子日期展示。</div>
+      <div class="calendar-note">仅显示已确认事件；按北京时间记录实际发生日期，缺失时按确认日期展示；不含预告。</div>
     </section>
     ${renderDetails(events)}
   </main>

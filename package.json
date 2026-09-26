@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-codex-reset",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Monitor AIHOT Codex reset events and notify Koishi channels.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

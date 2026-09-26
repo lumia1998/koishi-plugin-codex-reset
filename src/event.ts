@@ -45,7 +45,8 @@ function renderSourcePost(summary: LatestResetSummary): string {
   const avatar = getTiboAvatarDataUri()
     ? `<img class="avatar-image" src="${getTiboAvatarDataUri()}" alt="">`
     : '<span class="avatar-fallback">T</span>'
-  const text = post.text || post.originalText
+  const originalText = post.text || post.originalText
+  const text = originalText.length > 500 ? `${originalText.slice(0, 500)}…` : originalText
   const publishedAt = Date.parse(post.publishedAt)
   const time = Number.isFinite(publishedAt) ? formatDateTime(publishedAt) : '时间未知'
   return `<article class="post-card">
@@ -122,7 +123,7 @@ export function renderLatestResetHtml(summary: LatestResetSummary, now = new Dat
     </section>
     <section class="source">
       <header class="source-header"><h2>事件来源</h2><span>北京时间</span></header>
-      <h2 class="event-title">${escapeHtml(event.title)}</h2>
+      <h2 class="event-title">${escapeHtml(event.title.slice(0, 200))}</h2>
       ${renderSourcePost(summary)}
       <p class="source-note">${escapeHtml(event.scope ? `范围：${event.scope}` : '公开来源帖子记录')}</p>
       <div class="mark">RESET MONITOR</div>

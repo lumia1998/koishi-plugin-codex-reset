@@ -72,14 +72,14 @@ export interface LatestResetSummary {
 }
 
 function eventTimestamp(event: CodexResetEvent): { timestamp: number; approximate: boolean } | null {
-  if (event.confirmedAt) {
-    const timestamp = Date.parse(event.confirmedAt)
-    if (Number.isFinite(timestamp)) return { timestamp, approximate: false }
-  }
-
   if (event.occurredOn) {
     const timestamp = Date.parse(`${event.occurredOn}T12:00:00+08:00`)
     if (Number.isFinite(timestamp)) return { timestamp, approximate: true }
+  }
+
+  if (event.confirmedAt) {
+    const timestamp = Date.parse(event.confirmedAt)
+    if (Number.isFinite(timestamp)) return { timestamp, approximate: false }
   }
 
   for (const value of [event.schedule?.from, event.createdAt]) {

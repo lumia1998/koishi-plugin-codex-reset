@@ -179,7 +179,8 @@ function renderCalendarGrid(month: Date, marks: Map<string, CalendarMark[]>, sel
 }
 
 function renderPostCard(event: CodexResetEvent, post: CodexResetEvent['posts'][number]): string {
-  const text = post.text || post.originalText
+  const originalText = post.text || post.originalText
+  const text = originalText.length > 500 ? `${originalText.slice(0, 500)}…` : originalText
   const avatar = TIBO_AVATAR
     ? `<img class="avatar-image" src="${TIBO_AVATAR}" alt="">`
     : '<span class="avatar-fallback">T</span>'
@@ -204,7 +205,7 @@ function renderDetails(events: CodexResetEvent[]): string {
     const statusClass = event.status === 'confirmed' ? 'confirmed-state' : 'announced-state'
     return `<section class="event-group">
       <div class="event-state ${statusClass}"><span class="state-icon">${event.status === 'confirmed' ? '✓' : '◷'}</span>${status}</div>
-      <h2>${escapeHtml(event.title)}</h2>
+      <h2>${escapeHtml(event.title.slice(0, 200))}</h2>
       ${renderPostCard(event, post)}
     </section>`
   }).join('')

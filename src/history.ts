@@ -18,8 +18,8 @@ function parseTimestamp(value: string | null | undefined): number | null {
 
 function eventTimestamp(event: CodexResetEvent): number {
   const values = [
-    event.confirmedAt,
     event.occurredOn ? `${event.occurredOn}T12:00:00+08:00` : null,
+    event.confirmedAt,
     event.schedule?.from,
     event.createdAt,
   ]
@@ -46,10 +46,12 @@ export function filterHistoryEvents(
     day: 'numeric',
   }).formatToParts(now)
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  const targetMonth = new Date(Date.UTC(Number(values.year), Number(values.month) - 1 - months, 1))
+  const lastDay = new Date(Date.UTC(targetMonth.getUTCFullYear(), targetMonth.getUTCMonth() + 1, 0)).getUTCDate()
   const cutoff = Date.UTC(
-    Number(values.year),
-    Number(values.month) - 1 - months,
-    Number(values.day),
+    targetMonth.getUTCFullYear(),
+    targetMonth.getUTCMonth(),
+    Math.min(Number(values.day), lastDay),
     -8,
   )
   const current = now.getTime()
@@ -102,7 +104,8 @@ function statusLabel(event: CodexResetEvent): string {
 function renderPostPreview(event: CodexResetEvent): string {
   const post = event.posts[0]
   if (!post) return '<div class="post-preview empty">暂无来源帖子内容</div>'
-  const text = post.text || post.originalText
+  const originalText = post.text || post.originalText
+  const text = originalText.length > 500 ? `${originalText.slice(0, 500)}…` : originalText
   const avatar = getTiboAvatarDataUri()
     ? `<img class="avatar-image" src="${getTiboAvatarDataUri()}" alt="">`
     : '<span class="avatar-fallback">T</span>'
@@ -119,13 +122,13 @@ function renderPostPreview(event: CodexResetEvent): string {
 function renderTimelineItem(event: CodexResetEvent): string {
   const timestamp = eventTimestamp(event)
   const statusClass = event.status === 'confirmed' ? 'confirmed' : 'announced'
-  const schedule = event.schedule?.label ? `<div class="schedule">时间：${escapeHtml(event.schedule.label)}</div>` : ''
+  const schedule = event.schedule?.label ? `<div class="schedule">时间：${escapeHtml(event.schedule.label.slice(0, 150))}</div>` : ''
   return `<article class="timeline-item">
     <div class="timeline-date"><strong>${escapeHtml(dateLabel(timestamp))}</strong><span>${escapeHtml(timeLabel(timestamp))}</span></div>
     <div class="timeline-dot ${statusClass}"></div>
     <div class="event-card">
       <div class="event-meta"><span class="type-label">${typeLabel(event)}</span><span class="status ${statusClass}">${statusLabel(event)}</span></div>
-      <h2>${escapeHtml(event.title)}</h2>
+      <h2>${escapeHtml(event.title.slice(0, 200))}</h2>
       ${schedule}
       ${renderPostPreview(event)}
     </div>

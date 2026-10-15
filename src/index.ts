@@ -272,11 +272,29 @@ class CodexResetMonitor {
     // Commands only read the database. A missing snapshot must not turn every
     // user command into another upstream request during a rate-limit window.
     try {
-      return (await this.snapshots.read()).snapshot
+      let cache = await this.snapshots.read()
+      if (!cache.snapshot && this.pollPromise) {
+        // Startup sync may still be receiving its first response. Wait for the
+        // existing poll instead of replying before it can populate the table.
+        await this.pollPromise
+        cache = await this.snapshots.read()
+      }
+      return cache.snapshot
     } catch (error) {
       this.ctx.logger('codex-reset').warn(`读取重置数据失败：${error instanceof Error ? error.message : String(error)}`)
       return null
     }
+  }
+
+  async unavailableMessage(): Promise<string> {
+    try {
+      const cache = await this.snapshots.read()
+      const seconds = Math.ceil((cache.nextFetchAt - Date.now()) / 1000)
+      if (seconds > 0) return `暂时无法获取 Codex 重置事件数据：尚无可用缓存，约 ${seconds} 秒后自动重试同步。`
+    } catch {
+      // ensureSnapshot already records database read failures.
+    }
+    return '暂时无法获取 Codex 重置事件数据：首次同步尚未完成，请稍后再试。'
   }
 
   async poll(): Promise<void> {
@@ -291,10 +309,28 @@ class CodexResetMonitor {
   }
 
   async start(): Promise<void> {
+    this.ctx.logger('codex-reset').info('启动重置事件同步检查。')
     await this.poll()
-    if (!this.disposed) {
-      this.ctx.setInterval(() => this.poll(), Math.max(MIN_POLL_INTERVAL_MS, this.config.pollInterval * 1000))
+    await this.scheduleNextPoll()
+  }
+
+  private async scheduleNextPoll(): Promise<void> {
+    if (this.disposed) return
+    let delay = Math.max(MIN_POLL_INTERVAL_MS, this.config.pollInterval * 1000)
+    try {
+      const cache = await this.snapshots.read()
+      if (cache.nextFetchAt > Date.now()) delay = cache.nextFetchAt - Date.now()
+      this.ctx.logger('codex-reset').info(cache.snapshot
+        ? `重置数据已就绪（${cache.snapshot.events.length} 条事件），约 ${Math.ceil(delay / 1000)} 秒后同步。`
+        : `尚无可用重置数据，约 ${Math.ceil(delay / 1000)} 秒后自动重试同步。`)
+    } catch (error) {
+      this.ctx.logger('codex-reset').warn(`读取同步计划失败：${error instanceof Error ? error.message : String(error)}`)
     }
+    if (this.disposed) return
+    this.ctx.setTimeout(async () => {
+      await this.poll()
+      await this.scheduleNextPoll()
+    }, Math.max(1000, Math.min(delay, 2_147_483_647)))
   }
 
   dispose(): void {
@@ -470,7 +506,7 @@ class CodexResetMonitor {
     try {
       const headers: Record<string, string> = {
         Accept: 'application/json',
-        'User-Agent': 'koishi-plugin-codex-reset/0.1.6',
+        'User-Agent': 'koishi-plugin-codex-reset/0.1.7',
       }
       if (cache.etag && cache.snapshot) headers['If-None-Match'] = cache.etag
       const response = await fetch(this.config.apiUrl, {
@@ -552,7 +588,7 @@ export function apply(ctx: Context, config: Config): void {
     .alias('重置概率')
     .action(async () => {
       const snapshot = await monitor.ensureSnapshot()
-      if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
+      if (!snapshot) return monitor.unavailableMessage()
       const summary = analyzeProbability(snapshot)
       if (!monitor.hasPuppeteer) return formatProbability(summary)
       try {
@@ -570,7 +606,7 @@ export function apply(ctx: Context, config: Config): void {
     .alias('最近重置')
     .action(async () => {
       const snapshot = await monitor.ensureSnapshot()
-      if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
+      if (!snapshot) return monitor.unavailableMessage()
       const now = new Date()
       const latest = findLatestConfirmedReset(snapshot, now)
       if (!latest) return formatLatestReset(snapshot, now)
@@ -592,7 +628,7 @@ export function apply(ctx: Context, config: Config): void {
       if (!monitor.hasPuppeteer) return '发送日历图片需要先安装并启用 koishi-plugin-puppeteer。'
       try {
         const image = await monitor.createCalendarImage()
-        if (!image) return '暂时无法生成日历图片，请稍后再试。'
+        if (!image) return monitor.unavailableMessage()
         return h.image(image, 'image/png')
       } catch (error) {
         if (error instanceof RenderBusyError) return '图片生成任务较多，请稍后再试。'
@@ -608,7 +644,7 @@ export function apply(ctx: Context, config: Config): void {
       if (!monitor.hasPuppeteer) return '发送历史时间线图片需要先安装并启用 koishi-plugin-puppeteer。'
       try {
         const snapshot = await monitor.ensureSnapshot()
-        if (!snapshot) return '暂时无法获取 Codex 重置事件数据，请稍后再试。'
+        if (!snapshot) return monitor.unavailableMessage()
         const now = new Date()
         const historyRange = argv.options?.all
           ? 'all' as const
@@ -616,7 +652,7 @@ export function apply(ctx: Context, config: Config): void {
         const events = filterHistoryEvents(snapshot.events, now, historyRange)
         if (events.length > MAX_HISTORY_EVENTS) return `历史事件超过 ${MAX_HISTORY_EVENTS} 条，请缩小查询的月份范围。`
         const image = await monitor.createHistoryImage(events, now)
-        if (!image) return '暂时无法生成历史时间线图片，请稍后再试。'
+        if (!image) return monitor.unavailableMessage()
         return h.image(image, 'image/png')
       } catch (error) {
         if (error instanceof RenderBusyError) return '图片生成任务较多，请稍后再试。'

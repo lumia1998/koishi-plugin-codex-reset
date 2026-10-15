@@ -50,13 +50,14 @@ async function setup(t) {
     const dispose = []
     const timers = []
     const warnings = []
+    const infos = []
     // Exercise the real plugin's lifecycle and command handlers against an
     // actual SQLite database, with manual timers and no bot transport needed.
     const ctx = {
       baseDir: directory, model: app.model, database: app.database, bots: [],
-      logger: () => ({ warn: (message) => warnings.push(message), info: () => {} }),
+      logger: () => ({ warn: (message) => warnings.push(message), info: (message) => infos.push(message) }),
       on: (event, callback) => (event === 'ready' ? ready : dispose).push(callback),
-      setInterval: (callback, interval) => timers.push({ callback, interval }),
+      setTimeout: (callback, interval) => timers.push({ callback, interval }),
       command: (name) => {
         const command = {
           alias: () => command, option: () => command,
@@ -70,10 +71,10 @@ async function setup(t) {
       pushAnnouncements: true, pushConfirmedResets: true, mentionAll: false, ...options,
     })
     return {
-      app, warnings, timers,
+      app, warnings, infos, timers,
       start: async () => { for (const callback of ready) await callback() },
       query: (name) => commands.get(name)({ options: {} }),
-      poll: () => timers[0].callback(),
+      poll: () => timers.shift().callback(),
       disposePlugin: () => { for (const callback of dispose) callback() },
       close: async () => {
         for (const callback of dispose) await callback()
@@ -108,6 +109,61 @@ test('restart restores the SQLite snapshot and queries never request the API', a
   assert.match(await second.query('codex.probability'), /不是官方预测/)
   assert.match(await second.query('codex.event'), /全员重置/)
   assert.equal(requests, 1, 'ready and commands must respect the saved cooldown')
+})
+
+test('commands issued during the first sync wait for its result without another request', async (t) => {
+  const { open } = await setup(t)
+  let releaseResponse
+  let signalRequest
+  const requested = new Promise(resolve => { signalRequest = resolve })
+  let requests = 0
+  globalThis.fetch = () => {
+    requests++
+    signalRequest()
+    return new Promise(resolve => { releaseResponse = resolve })
+  }
+  const monitor = await open()
+  const starting = monitor.start()
+  await requested
+  let settled = 0
+  const commands = ['codex.probability', 'codex.event'].map((name) => monitor.query(name).then((result) => {
+    settled++
+    return result
+  }))
+  // Let the SQLite reads complete while the initial API response is pending.
+  await new Promise(resolve => setTimeout(resolve, 20))
+  const settledBeforeResponse = settled
+  releaseResponse(Response.json(snapshot()))
+  const [probability, event] = await Promise.all(commands)
+  await starting
+  assert.equal(settledBeforeResponse, 0, 'queries should wait for the initial sync')
+  assert.match(probability, /不是官方预测/)
+  assert.match(event, /全员重置/)
+  assert.equal(requests, 1)
+})
+
+test('startup resumes at the saved cooldown deadline and reports why no data is available', async (t) => {
+  const { open, advance } = await setup(t)
+  let requests = 0
+  globalThis.fetch = async () => {
+    requests++
+    if (requests === 1) return Response.json({ retryAfter: 1200 }, { status: 429 })
+    return Response.json(snapshot())
+  }
+  const first = await open()
+  await first.start()
+  await first.close()
+  advance(1100_000)
+  const second = await open()
+  await second.start()
+  assert.equal(requests, 1)
+  assert.equal(second.timers[0].interval, 100_000, 'resume the remaining cooldown instead of waiting another 11 minutes')
+  assert.match(await second.query('codex.probability'), /尚无可用缓存.*100 秒后自动重试/)
+  assert.ok(second.infos.some(message => /尚无可用重置数据.*100 秒后/.test(message)))
+  advance(100_000)
+  await second.poll()
+  assert.equal(requests, 2)
+  assert.match(await second.query('codex.probability'), /不是官方预测/)
 })
 
 test('ETag survives restart and 304 retains the full history in SQLite', async (t) => {

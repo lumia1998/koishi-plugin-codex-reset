@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-codex-reset",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Monitor AIHOT Codex reset events and notify Koishi channels.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -44,6 +44,7 @@
     }
   },
   "devDependencies": {
+    "@minatojs/driver-sqlite": "4.7.0",
     "@types/node": "^22.0.0",
     "koishi": "^4.18.9",
     "typescript": "^5.7.0"

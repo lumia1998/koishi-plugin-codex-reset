@@ -7,6 +7,8 @@ import { renderCalendarImage } from './calendar'
 import { filterHistoryEvents, renderHistoryImage } from './history'
 import { renderLatestResetImage } from './event'
 import { renderProbabilityImage } from './probability'
+import { extendCacheModel, MIN_POLL_INTERVAL_MS, SnapshotRequestError, SnapshotStore } from './cache'
+import type { FetchResult, SnapshotCache } from './cache'
 import { analyzeProbability, findLatestConfirmedReset, formatLatestReset, formatProbability } from './stats'
 import type { LatestResetSummary, ProbabilitySummary } from './stats'
 import type {
@@ -41,10 +43,12 @@ interface StoredState {
 
 class RenderBusyError extends Error {}
 export const inject = {
+  required: ['database'],
   optional: ['puppeteer'],
 }
 
 export type Config = PluginConfig
+export type { SnapshotCache } from './cache'
 
 export const Config: Schema<Config> = Schema.object({
   apiUrl: Schema.string()
@@ -52,8 +56,8 @@ export const Config: Schema<Config> = Schema.object({
     .description('监控接口地址。通常不需要修改。'),
   pollInterval: Schema.number()
     .min(60)
-    .default(300)
-    .description('监控间隔，单位为秒。AIHOT 推荐约 5 分钟轮询一次。'),
+    .default(660)
+    .description('监控间隔，单位为秒，默认 660 秒。兼容旧配置，实际请求间隔至少 660 秒；重启后继续遵守已保存的冷却时间。'),
   requestTimeout: Schema.number()
     .min(5000)
     .default(15000)
@@ -90,12 +94,6 @@ export const Config: Schema<Config> = Schema.object({
     mentionAll: '艾特全体',
   },
 })
-
-interface FetchResult {
-  snapshot: CodexResetsResponse | null
-  etag: string | null
-  notModified: boolean
-}
 
 type MessageContent = string | ReturnType<typeof h> | ReturnType<typeof h>[]
 
@@ -246,8 +244,7 @@ async function sendToTargets(
 }
 
 class CodexResetMonitor {
-  private snapshot: CodexResetsResponse | null = null
-  private etag: string | null = null
+  private readonly snapshots: SnapshotStore
   private pollPromise: Promise<void> | null = null
   private disposed = false
   private readonly statePath: string
@@ -259,6 +256,7 @@ class CodexResetMonitor {
   private nextRenderAllowedAt = 0
 
   constructor(private readonly ctx: PuppeteerContext, private readonly config: Config) {
+    this.snapshots = new SnapshotStore(ctx, config.apiUrl, isSnapshot)
     const instanceId = createHash('sha256')
       .update(JSON.stringify({ apiUrl: config.apiUrl, targets: config.targets }))
       .digest('hex').slice(0, 16)
@@ -266,17 +264,19 @@ class CodexResetMonitor {
     this.stateLoaded = this.loadState()
   }
 
-  get currentSnapshot(): CodexResetsResponse | null {
-    return this.snapshot
-  }
-
   get hasPuppeteer(): boolean {
     return Boolean(this.ctx.puppeteer)
   }
 
   async ensureSnapshot(): Promise<CodexResetsResponse | null> {
-    if (!this.snapshot) await this.poll()
-    return this.snapshot
+    // Commands only read the database. A missing snapshot must not turn every
+    // user command into another upstream request during a rate-limit window.
+    try {
+      return (await this.snapshots.read()).snapshot
+    } catch (error) {
+      this.ctx.logger('codex-reset').warn(`读取重置数据失败：${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
   }
 
   async poll(): Promise<void> {
@@ -290,6 +290,13 @@ class CodexResetMonitor {
     }
   }
 
+  async start(): Promise<void> {
+    await this.poll()
+    if (!this.disposed) {
+      this.ctx.setInterval(() => this.poll(), Math.max(MIN_POLL_INTERVAL_MS, this.config.pollInterval * 1000))
+    }
+  }
+
   dispose(): void {
     this.disposed = true
   }
@@ -297,16 +304,20 @@ class CodexResetMonitor {
   private async performPoll(): Promise<void> {
     try {
       await this.stateLoaded
-      const result = await this.fetchSnapshot()
-      if (!result.notModified && result.snapshot) {
-        this.snapshot = result.snapshot
-        this.etag = result.etag ?? this.etag
+      if (this.disposed) return
+      const cache = await this.snapshots.refresh(
+        this.config.pollInterval * 1000,
+        this.config.requestTimeout,
+        (cached) => this.fetchSnapshot(cached),
+      )
+      if (this.disposed) return
+      if (cache.snapshot) {
         if (!this.initialized) {
           // A fresh installation starts with the entire current snapshot as its baseline.
-          for (const event of result.snapshot.events) this.markSeen(event)
+          for (const event of cache.snapshot.events) this.markSeen(event)
           this.initialized = true
         } else {
-          this.captureChanges(result.snapshot, Date.now())
+          this.captureChanges(cache.snapshot, Date.now())
         }
       }
       await this.flushPending()
@@ -453,62 +464,88 @@ class CodexResetMonitor {
     if (changed) await this.saveState()
   }
 
-  private async fetchSnapshot(): Promise<FetchResult> {
+  private async fetchSnapshot(cache: SnapshotCache): Promise<FetchResult> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeout)
     try {
       const headers: Record<string, string> = {
         Accept: 'application/json',
-        'User-Agent': 'koishi-plugin-codex-reset/0.1.5',
+        'User-Agent': 'koishi-plugin-codex-reset/0.1.6',
       }
-      if (this.etag && this.snapshot) headers['If-None-Match'] = this.etag
+      if (cache.etag && cache.snapshot) headers['If-None-Match'] = cache.etag
       const response = await fetch(this.config.apiUrl, {
         method: 'GET',
         headers,
         signal: controller.signal,
       })
-      if (response.status === 304 && this.snapshot) {
-        return { snapshot: null, etag: this.etag, notModified: true }
+      const maxAgeMs = Math.max(0, ...Array.from(
+        (response.headers.get('cache-control') ?? '').matchAll(/(?:^|[,\s])(?:s-maxage|max-age)=(\d+)/gi),
+        (match) => Number(match[1]) * 1000,
+      ).filter(Number.isFinite))
+      if (response.status === 304 && cache.snapshot) {
+        return { snapshot: null, etag: response.headers.get('etag') ?? cache.etag, notModified: true, maxAgeMs }
       }
       if (response.status === 304) throw new Error('服务端在没有本地快照时返回了 304')
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const declaredLength = Number(response.headers.get('content-length'))
-      if (declaredLength > MAX_API_RESPONSE_BYTES) throw new Error('API 响应超过 4 MiB')
-      if (!response.body) throw new Error('API 响应没有内容')
-      const reader = response.body.getReader()
-      const chunks: Uint8Array[] = []
-      let size = 0
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        size += value.byteLength
-        if (size > MAX_API_RESPONSE_BYTES) {
-          await reader.cancel()
-          throw new Error('API 响应超过 4 MiB')
+      if (response.status === 429 || response.status === 503) {
+        const retryAfter = response.headers.get('retry-after')
+        let retryAfterMs = 0
+        if (retryAfter) {
+          retryAfterMs = /^\d+$/.test(retryAfter.trim())
+            ? Number(retryAfter) * 1000
+            : Date.parse(retryAfter) - Date.now()
         }
-        chunks.push(value)
+        try {
+          const problem: unknown = await this.readResponseBody(response)
+          if (isRecord(problem) && typeof problem.retryAfter === 'number' && Number.isFinite(problem.retryAfter)) {
+            retryAfterMs = Math.max(Number.isFinite(retryAfterMs) ? retryAfterMs : 0, problem.retryAfter * 1000)
+          }
+        } catch {
+          // An HTML or malformed error body must still honor Retry-After.
+        }
+        retryAfterMs = Math.max(MIN_POLL_INTERVAL_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0)
+        throw new SnapshotRequestError(`HTTP ${response.status}，至少等待 ${Math.ceil(retryAfterMs / 1000)} 秒后重试`, retryAfterMs)
       }
-      const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const body = await this.readResponseBody(response)
       if (!isSnapshot(body)) throw new Error('响应格式不符合 Codex 重置 API v1')
       return {
         snapshot: body,
         etag: response.headers.get('etag'),
         notModified: false,
+        maxAgeMs,
       }
     } finally {
       clearTimeout(timeout)
     }
   }
 
+  private async readResponseBody(response: Response): Promise<unknown> {
+    const declaredLength = Number(response.headers.get('content-length'))
+    if (declaredLength > MAX_API_RESPONSE_BYTES) throw new Error('API 响应超过 4 MiB')
+    if (!response.body) throw new Error('API 响应没有内容')
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.byteLength
+      if (size > MAX_API_RESPONSE_BYTES) {
+        await reader.cancel()
+        throw new Error('API 响应超过 4 MiB')
+      }
+      chunks.push(value)
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  }
+
 }
 
 export function apply(ctx: Context, config: Config): void {
+  extendCacheModel(ctx)
   const monitor = new CodexResetMonitor(ctx as PuppeteerContext, config)
 
-  ctx.on('ready', () => {
-    void monitor.poll()
-    ctx.setInterval(() => void monitor.poll(), config.pollInterval * 1000)
-  })
+  ctx.on('ready', () => monitor.start())
   ctx.on('dispose', () => monitor.dispose())
 
   ctx.command('codex.probability', '分析 Codex 重置事件的历史概率')

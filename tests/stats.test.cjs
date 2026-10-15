@@ -42,8 +42,10 @@ test('analyzes confirmed event days and pending announcements', () => {
   assert.match(formatProbability(result), /未重置预告 1 条/)
 })
 
-test('formats the latest confirmed reset as elapsed hours', () => {
-  const result = formatLatestReset(snapshot(), new Date('2026-09-03T05:00:00+08:00'))
+test('formats a reset with an exact confirmation time as elapsed hours', () => {
+  const data = snapshot()
+  data.events[1].occurredOn = null
+  const result = formatLatestReset(data, new Date('2026-09-03T05:00:00+08:00'))
   assert.match(result, /上一次重置：约 4 小时前/)
   assert.match(result, /类型：重置卡/)
 })

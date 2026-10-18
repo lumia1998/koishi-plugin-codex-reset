@@ -46,6 +46,23 @@ export function extendCacheModel(ctx: Context): void {
   }, { primary: 'id' })
 }
 
+/**
+ * Validate the configured API address once, so a typo surfaces as a readable
+ * Chinese error during plugin load instead of a bare `TypeError: Invalid URL`.
+ */
+export function resolveApiUrl(apiUrl: string): string {
+  let url: URL
+  try {
+    url = new URL(apiUrl)
+  } catch {
+    throw new Error(`配置项「监控接口地址」不是合法的 URL：${apiUrl}`)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`配置项「监控接口地址」只支持 http/https 协议：${apiUrl}`)
+  }
+  return url.href
+}
+
 export class SnapshotStore {
   private readonly id: string
 
@@ -55,7 +72,7 @@ export class SnapshotStore {
     private readonly validate: (value: unknown) => value is CodexResetsResponse,
   ) {
     // Targets do not affect API data or the upstream request quota.
-    this.id = createHash('sha256').update(new URL(apiUrl).href).digest('hex')
+    this.id = createHash('sha256').update(resolveApiUrl(apiUrl)).digest('hex')
   }
 
   async read(): Promise<SnapshotCache> {

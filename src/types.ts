@@ -57,4 +57,6 @@ export interface Config {
   pushAnnouncements: boolean
   pushConfirmedResets: boolean
   mentionAll: boolean
+  commandAuthority: number
+  renderCooldown: number
 }

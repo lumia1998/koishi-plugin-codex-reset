@@ -1,5 +1,6 @@
 import { Context, h, Schema } from 'koishi'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { CalendarBrowser } from './calendar'
@@ -20,12 +21,32 @@ import type {
 
 export const name = 'codex-reset'
 
+export const usage = `
+监控 AIHOT 的 Codex 重置事件，并在重置发生时推送到指定频道。
+
+- \`codex.probability\` / \`重置概率\`：概率统计卡片
+- \`codex.event\` / \`最近重置\`：最近一次已确认重置
+- \`codex.calendar\` / \`重置日历\`：本月日历
+- \`codex.history\` / \`重置历史\`：历史时间线（\`-3\` 最近 3 个月，\`-a\` 全部）
+
+需要先启用数据库插件；图片功能需要 \`koishi-plugin-puppeteer\`。
+`
+
 const MAX_NOTIFICATION_AGE_MS = 48 * 60 * 60 * 1000
 const MAX_PENDING_AGE_MS = 48 * 60 * 60 * 1000
 const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
 const MAX_HISTORY_EVENTS = 120
 const MAX_CONCURRENT_RENDERS = 2
 const RENDER_START_INTERVAL_MS = 3000
+
+const PLUGIN_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')) as { version?: string }
+    return manifest.version ?? '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
 
 interface PendingNotification {
   key: string
@@ -79,6 +100,13 @@ export const Config: Schema<Config> = Schema.object({
   mentionAll: Schema.boolean()
     .default(false)
     .description('推送通知时是否艾特全体。需要平台和频道支持全体艾特。'),
+  commandAuthority: Schema.natural()
+    .default(0)
+    .description('执行命令所需的最低权限等级。0 表示所有用户可用；设为 2 及以上可限制为管理员。'),
+  renderCooldown: Schema.number()
+    .min(0)
+    .default(5)
+    .description('同一用户两次生成图片的最小间隔，单位为秒。0 表示不限制。'),
 }).i18n({
   'zh-CN': {
     apiUrl: '监控接口地址',
@@ -92,6 +120,8 @@ export const Config: Schema<Config> = Schema.object({
     pushAnnouncements: '推送重置预告',
     pushConfirmedResets: '推送已确认重置',
     mentionAll: '艾特全体',
+    commandAuthority: '命令权限等级',
+    renderCooldown: '图片生成冷却',
   },
 })
 
@@ -243,6 +273,36 @@ async function sendToTargets(
   return complete
 }
 
+interface CooldownSession {
+  platform?: string
+  userId?: string
+}
+
+/**
+ * Per-user throttle for the image commands. The render pool rejects excess work
+ * instead of queueing it, so without this a busy group mostly sees "任务较多".
+ */
+function createRenderLimiter(config: Config) {
+  const cooldownMs = Math.max(0, config.renderCooldown ?? 0) * 1000
+  const lastRenderAt = new Map<string, number>()
+  return (session?: CooldownSession): string | null => {
+    if (cooldownMs <= 0) return null
+    const now = Date.now()
+    if (lastRenderAt.size > 1000) {
+      for (const [key, timestamp] of lastRenderAt) {
+        if (now - timestamp >= cooldownMs) lastRenderAt.delete(key)
+      }
+    }
+    const key = `${session?.platform ?? ''}\u0000${session?.userId ?? ''}`
+    const previous = lastRenderAt.get(key)
+    if (previous !== undefined && now - previous < cooldownMs) {
+      return `图片生成过于频繁，请 ${Math.ceil((cooldownMs - (now - previous)) / 1000)} 秒后再试。`
+    }
+    lastRenderAt.set(key, now)
+    return null
+  }
+}
+
 class CodexResetMonitor {
   private readonly snapshots: SnapshotStore
   private pollPromise: Promise<void> | null = null
@@ -356,10 +416,19 @@ class CodexResetMonitor {
           this.captureChanges(cache.snapshot, Date.now())
         }
       }
-      await this.flushPending()
     } catch (error) {
       this.ctx.logger('codex-reset').warn(
-        `获取 AIHOT 重置事件失败：${error instanceof Error ? error.message : String(error)}`,
+        `同步 AIHOT 重置事件失败：${error instanceof Error ? error.message : String(error)}`,
+      )
+      return
+    }
+    try {
+      await this.flushPending()
+    } catch (error) {
+      // Delivery and state persistence used to share the upstream error message,
+      // which made send failures look like network outages.
+      this.ctx.logger('codex-reset').warn(
+        `推送重置通知失败：${error instanceof Error ? error.message : String(error)}`,
       )
     }
   }
@@ -372,10 +441,17 @@ class CodexResetMonitor {
   }
 
   async createHistoryImage(events?: CodexResetEvent[], now = new Date()): Promise<Buffer | null> {
-    const snapshot = await this.ensureSnapshot()
     const browser = this.ctx.puppeteer
-    if (!snapshot || !browser) return null
-    return this.withRenderSlot(() => renderHistoryImage(browser, events ?? snapshot.events, now))
+    if (!browser) return null
+    // The command already resolved a snapshot; only fall back to a database read
+    // when the caller really has no events in hand.
+    let list = events
+    if (!list) {
+      const snapshot = await this.ensureSnapshot()
+      if (!snapshot) return null
+      list = snapshot.events
+    }
+    return this.withRenderSlot(() => renderHistoryImage(browser, list!, now))
   }
 
   async createProbabilityImage(summary: ProbabilitySummary): Promise<Buffer | null> {
@@ -506,7 +582,7 @@ class CodexResetMonitor {
     try {
       const headers: Record<string, string> = {
         Accept: 'application/json',
-        'User-Agent': 'koishi-plugin-codex-reset/0.1.7',
+        'User-Agent': `koishi-plugin-codex-reset/${PLUGIN_VERSION}`,
       }
       if (cache.etag && cache.snapshot) headers['If-None-Match'] = cache.etag
       const response = await fetch(this.config.apiUrl, {
@@ -580,17 +656,20 @@ class CodexResetMonitor {
 export function apply(ctx: Context, config: Config): void {
   extendCacheModel(ctx)
   const monitor = new CodexResetMonitor(ctx as PuppeteerContext, config)
+  const limiter = createRenderLimiter(config)
 
   ctx.on('ready', () => monitor.start())
   ctx.on('dispose', () => monitor.dispose())
 
-  ctx.command('codex.probability', '分析 Codex 重置事件的历史概率')
+  ctx.command('codex.probability', '分析 Codex 重置事件的历史概率', { authority: config.commandAuthority })
     .alias('重置概率')
-    .action(async () => {
+    .action(async ({ session }) => {
       const snapshot = await monitor.ensureSnapshot()
       if (!snapshot) return monitor.unavailableMessage()
       const summary = analyzeProbability(snapshot)
       if (!monitor.hasPuppeteer) return formatProbability(summary)
+      const limited = limiter(session)
+      if (limited) return limited
       try {
         const image = await monitor.createProbabilityImage(summary)
         if (!image) return formatProbability(summary)
@@ -602,15 +681,17 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
 
-  ctx.command('codex.event', '查看上一次 Codex 重置距今多久')
+  ctx.command('codex.event', '查看上一次 Codex 重置距今多久', { authority: config.commandAuthority })
     .alias('最近重置')
-    .action(async () => {
+    .action(async ({ session }) => {
       const snapshot = await monitor.ensureSnapshot()
       if (!snapshot) return monitor.unavailableMessage()
       const now = new Date()
       const latest = findLatestConfirmedReset(snapshot, now)
       if (!latest) return formatLatestReset(snapshot, now)
       if (!monitor.hasPuppeteer) return formatLatestReset(snapshot, now)
+      const limited = limiter(session)
+      if (limited) return limited
       try {
         const image = await monitor.createLatestResetImage(latest, now)
         if (!image) return formatLatestReset(snapshot, now)
@@ -622,10 +703,12 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
 
-  ctx.command('codex.calendar', '发送本月的 Codex 重置日历图片')
+  ctx.command('codex.calendar', '发送本月的 Codex 重置日历图片', { authority: config.commandAuthority })
     .alias('重置日历')
-    .action(async () => {
+    .action(async ({ session }) => {
       if (!monitor.hasPuppeteer) return '发送日历图片需要先安装并启用 koishi-plugin-puppeteer。'
+      const limited = limiter(session)
+      if (limited) return limited
       try {
         const image = await monitor.createCalendarImage()
         if (!image) return monitor.unavailableMessage()
@@ -637,11 +720,13 @@ export function apply(ctx: Context, config: Config): void {
       }
     })
 
-  ctx.command('codex.history [range:number]', '发送 Codex 重置历史时间线图片')
+  ctx.command('codex.history [range:number]', '发送 Codex 重置历史时间线图片', { authority: config.commandAuthority })
     .alias('重置历史')
     .option('all', '-a 查看全部历史')
     .action(async (argv, range?: number) => {
       if (!monitor.hasPuppeteer) return '发送历史时间线图片需要先安装并启用 koishi-plugin-puppeteer。'
+      const limited = limiter(argv.session)
+      if (limited) return limited
       try {
         const snapshot = await monitor.ensureSnapshot()
         if (!snapshot) return monitor.unavailableMessage()

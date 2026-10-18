@@ -9,17 +9,23 @@ const MONTH_NAMES = [
 const WEEK_NAMES = ['一', '二', '三', '四', '五', '六', '日']
 const DAY_MS = 24 * 60 * 60 * 1000
 
+let cachedAvatar: string | undefined
+
+/** Reads the bundled avatar at most once: every render used to hit the disk twice. */
 export function getTiboAvatarDataUri(): string {
+  if (cachedAvatar !== undefined) return cachedAvatar
   const candidates = [
     join(__dirname, '..', 'resources', 'tibo-avatar.jpg'),
     join(process.cwd(), 'resources', 'tibo-avatar.jpg'),
   ]
   for (const file of candidates) {
     if (existsSync(file)) {
-      return `data:image/jpeg;base64,${readFileSync(file).toString('base64')}`
+      cachedAvatar = `data:image/jpeg;base64,${readFileSync(file).toString('base64')}`
+      return cachedAvatar
     }
   }
-  return ''
+  cachedAvatar = ''
+  return cachedAvatar
 }
 
 const TIBO_AVATAR = getTiboAvatarDataUri()

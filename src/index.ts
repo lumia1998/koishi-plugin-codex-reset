@@ -9,6 +9,7 @@ import { filterHistoryEvents, renderHistoryImage } from './history'
 import { renderLatestResetImage } from './event'
 import { renderProbabilityImage } from './probability'
 import { extendCacheModel, MIN_POLL_INTERVAL_MS, SnapshotRequestError, SnapshotStore } from './cache'
+import { extendPendingModel, PendingQueue } from './pending'
 import type { FetchResult, SnapshotCache } from './cache'
 import { analyzeProbability, findLatestConfirmedReset, formatLatestReset, formatProbability } from './stats'
 import type { LatestResetSummary, ProbabilitySummary } from './stats'
@@ -59,7 +60,8 @@ interface StoredState {
   version: 1
   initialized: boolean
   seenStages: string[]
-  pending: PendingNotification[]
+  /** Only written by 0.1.7 and earlier; migrated into the database on load. */
+  pending?: PendingNotification[]
 }
 
 class RenderBusyError extends Error {}
@@ -241,7 +243,7 @@ async function sendToTargets(
   targets: TargetConfig[],
   content: MessageContent,
   deliveredBindings: string[],
-  onDelivered: () => Promise<void>,
+  onDelivered: (binding: string) => Promise<void>,
 ): Promise<boolean> {
   const delivered = new Set(deliveredBindings)
   let complete = true
@@ -264,7 +266,7 @@ async function sendToTargets(
         }
         delivered.add(key)
         deliveredBindings.push(key)
-        await onDelivered()
+        await onDelivered(key)
         break
       }
       if (!delivered.has(key)) complete = false
@@ -310,13 +312,15 @@ class CodexResetMonitor {
   private readonly statePath: string
   private readonly stateLoaded: Promise<void>
   private readonly seenStages = new Set<string>()
-  private readonly pending = new Map<string, PendingNotification>()
+  private readonly queue: PendingQueue
+  private legacyPending: PendingNotification[] = []
   private initialized = false
   private activeRenders = 0
   private nextRenderAllowedAt = 0
 
   constructor(private readonly ctx: PuppeteerContext, private readonly config: Config) {
     this.snapshots = new SnapshotStore(ctx, config.apiUrl, isSnapshot)
+    this.queue = new PendingQueue(ctx)
     const instanceId = createHash('sha256')
       .update(JSON.stringify({ apiUrl: config.apiUrl, targets: config.targets }))
       .digest('hex').slice(0, 16)
@@ -400,6 +404,7 @@ class CodexResetMonitor {
   private async performPoll(): Promise<void> {
     try {
       await this.stateLoaded
+      await this.migrateLegacyPending()
       if (this.disposed) return
       const cache = await this.snapshots.refresh(
         this.config.pollInterval * 1000,
@@ -413,7 +418,7 @@ class CodexResetMonitor {
           for (const event of cache.snapshot.events) this.markSeen(event)
           this.initialized = true
         } else {
-          this.captureChanges(cache.snapshot, Date.now())
+          await this.captureChanges(cache.snapshot, Date.now())
         }
       }
     } catch (error) {
@@ -483,21 +488,26 @@ class CodexResetMonitor {
   private async loadState(): Promise<void> {
     try {
       const state: unknown = JSON.parse(await readFile(this.statePath, 'utf8'))
-      if (!isRecord(state) || state.version !== 1 || !Array.isArray(state.seenStages) || !Array.isArray(state.pending)) {
+      if (!isRecord(state) || state.version !== 1 || !Array.isArray(state.seenStages)) {
         throw new Error('状态文件格式无效')
       }
       this.initialized = state.initialized === true
       for (const key of state.seenStages) {
         if (typeof key === 'string') this.seenStages.add(key)
       }
-      for (const item of state.pending) {
+      // 0.1.7 kept the queue in this file. Move those entries into the database
+      // once, then never write the queue here again.
+      const legacyPending = Array.isArray(state.pending) ? state.pending : []
+      for (const item of legacyPending) {
         if (!isRecord(item) || typeof item.key !== 'string' || typeof item.message !== 'string'
-          || typeof item.createdAt !== 'number' || !Array.isArray(item.deliveredBindings)) continue
-        this.pending.set(item.key, {
+          || typeof item.createdAt !== 'number') continue
+        this.legacyPending.push({
           key: item.key,
           message: item.message,
           createdAt: item.createdAt,
-          deliveredBindings: item.deliveredBindings.filter((key): key is string => typeof key === 'string'),
+          deliveredBindings: Array.isArray(item.deliveredBindings)
+            ? item.deliveredBindings.filter((key): key is string => typeof key === 'string')
+            : [],
         })
       }
     } catch (error) {
@@ -513,7 +523,6 @@ class CodexResetMonitor {
       version: 1,
       initialized: this.initialized,
       seenStages: [...this.seenStages],
-      pending: [...this.pending.values()],
     }
     const temporaryPath = `${this.statePath}.${process.pid}.tmp`
     try {
@@ -528,11 +537,19 @@ class CodexResetMonitor {
     }
   }
 
+  private async migrateLegacyPending(): Promise<void> {
+    if (!this.legacyPending.length) return
+    for (const item of this.legacyPending) {
+      await this.queue.add(item.key, item.message, item.createdAt)
+    }
+    this.legacyPending = []
+  }
+
   private markSeen(event: CodexResetEvent): void {
     for (const key of stageKeys(event)) this.seenStages.add(key)
   }
 
-  private captureChanges(current: CodexResetsResponse, now: number): void {
+  private async captureChanges(current: CodexResetsResponse, now: number): Promise<void> {
     for (const event of current.events) {
       const keys = stageKeys(event)
       const alreadySeen = keys.some((key) => this.seenStages.has(key))
@@ -549,31 +566,37 @@ class CodexResetMonitor {
         continue
       }
       const key = keys[0]
-      this.pending.set(key, { key, message, createdAt: now, deliveredBindings: [] })
+      await this.queue.add(key, message, now)
     }
   }
 
   private async flushPending(): Promise<void> {
-    // Persist the observed stages and queue before sending. This also repairs
-    // a previous write failure when the next API response is 304.
+    // Persist the observed stages before sending. This also repairs a previous
+    // write failure when the next API response is 304.
     await this.saveState()
-    let changed = false
-    for (const [key, item] of this.pending) {
-      if (Date.now() - item.createdAt > MAX_PENDING_AGE_MS) {
-        this.ctx.logger('codex-reset').warn(`推送超过 48 小时仍未完成，已放弃：${key}`)
-        this.pending.delete(key)
-        changed = true
-        continue
+    const pruned = await this.queue.prune(MAX_PENDING_AGE_MS)
+    if (pruned) this.ctx.logger('codex-reset').warn(`已放弃 ${pruned} 条超过 48 小时未送达的推送。`)
+    for (const row of await this.queue.list()) {
+      const claimed = await this.queue.claim(row.key)
+      // Another instance is delivering this one right now.
+      if (!claimed) continue
+      let complete = false
+      try {
+        const content: MessageContent = this.config.mentionAll
+          ? [h('at', { type: 'all' }), h.text(`\n${claimed.message}`)]
+          : claimed.message
+        complete = await sendToTargets(
+          this.ctx,
+          this.config.targets,
+          content,
+          claimed.delivered,
+          (binding) => this.queue.appendDelivered(claimed.key, binding),
+        )
+        if (complete) await this.queue.complete(claimed.key)
+      } finally {
+        if (!complete) await this.queue.release(claimed.key)
       }
-      const content: MessageContent = this.config.mentionAll
-        ? [h('at', { type: 'all' }), h.text(`\n${item.message}`)]
-        : item.message
-      const deliveredCount = item.deliveredBindings.length
-      const complete = await sendToTargets(this.ctx, this.config.targets, content, item.deliveredBindings, () => this.saveState())
-      if (complete) this.pending.delete(key)
-      if (complete || deliveredCount !== item.deliveredBindings.length) changed = true
     }
-    if (changed) await this.saveState()
   }
 
   private async fetchSnapshot(cache: SnapshotCache): Promise<FetchResult> {
@@ -655,6 +678,7 @@ class CodexResetMonitor {
 
 export function apply(ctx: Context, config: Config): void {
   extendCacheModel(ctx)
+  extendPendingModel(ctx)
   const monitor = new CodexResetMonitor(ctx as PuppeteerContext, config)
   const limiter = createRenderLimiter(config)
 
